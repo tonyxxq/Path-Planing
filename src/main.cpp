@@ -236,6 +236,7 @@ int main() {
           	// Previous path data given to the Planner
           	auto previous_path_x = j[1]["previous_path_x"];
           	auto previous_path_y = j[1]["previous_path_y"];
+
           	// Previous path's end s and d values
           	double end_path_s = j[1]["end_path_s"];
           	double end_path_d = j[1]["end_path_d"];
@@ -251,14 +252,14 @@ int main() {
               car_s = end_path_s;
             }
 
-            // Prediction : Analysing other cars positions.
+            // 预测：其他车辆的位置，估计在当前车辆的前面/左边/右边指定范围内是否有车，以决定哪些道可以走
             bool car_ahead = false;
             bool car_left = false;
             bool car_righ = false;
             for ( int i = 0; i < sensor_fusion.size(); i++ ) {
-                float d = sensor_fusion[i][6];
+            	// 根据 d 判断在哪条车道
+            	float d = sensor_fusion[i][6];
                 int car_lane = -1;
-                // is it on the same lane we are
                 if ( d > 0 && d < 4 ) {
                   car_lane = 0;
                 } else if ( d > 4 && d < 8 ) {
@@ -269,28 +270,37 @@ int main() {
                 if (car_lane < 0) {
                   continue;
                 }
-                // Find car speed.
+
+                // 根据 vx，vy 获取车辆的行驶速度 v
                 double vx = sensor_fusion[i][3];
                 double vy = sensor_fusion[i][4];
                 double check_speed = sqrt(vx*vx + vy*vy);
+
+                // 车辆估计在走完之前的路径后的 s，因为只能获取当前无人车的按照路径走下去的最终位置 end_path_s
                 double check_car_s = sensor_fusion[i][5];
-                // Estimate car s position after executing previous trajectory.
-                check_car_s += ((double)prev_size*0.02*check_speed);
+                check_car_s += ((double)prev_size * 0.02 * check_speed);
 
                 if ( car_lane == lane ) {
-                  // Car in our lane.
+                  // 在当前车道
                   car_ahead |= check_car_s > car_s && check_car_s - car_s < 30;
                 } else if ( car_lane - lane == -1 ) {
-                  // Car left
+                  // 在左边车道
                   car_left |= car_s - 30 < check_car_s && car_s + 30 > check_car_s;
                 } else if ( car_lane - lane == 1 ) {
-                  // Car right
+                  // 在右边车道
                   car_righ |= car_s - 30 < check_car_s && car_s + 30 > check_car_s;
                 }
             }
 
-            // Behavior : Let's see what to do.
-            double speed_diff = 0;
+            // 行为， 决定变道/加速/减速
+            // 1. 前面有车
+            //    1.1 左边没车且左边有道，变道左边
+            //    1.2 右边没车且右边有道，变道右边
+            //    1.3 否则, 减速
+            // 2. 前面没车
+            //    2.1 如果不在中间道，且可变回中间道，变回中间道
+            //    2.2 否则加速
+            double speed_diff = 0; // 用于在后面判断是加速还是减速
             const double MAX_SPEED = 49.5;
             const double MAX_ACC = .224;
             if ( car_ahead ) { // Car ahead
@@ -314,6 +324,9 @@ int main() {
               }
             }
 
+            // 获取路径的前两个点，这样做的目的是获取行驶的方向 ref_yaw 和前两个点
+            // 1. 如果前路径剩余的点多，使用前路径点的最后两个点
+            // 2. 否则根据当前的角度和当前点，确定一个前点
           	vector<double> ptsx;
             vector<double> ptsy;
 
@@ -348,10 +361,10 @@ int main() {
                 ptsy.push_back(ref_y);
             }
 
-            // Setting up target points in the future.
+            // 根据 Frenet 坐标确定后面的 3 个点， 并转化为迪卡尔坐标
             vector<double> next_wp0 = getXY(car_s + 30, 2 + 4*lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
-            vector<double> next_wp1 = getXY(car_s + 60, 2 + 4*lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
-            vector<double> next_wp2 = getXY(car_s + 90, 2 + 4*lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp1 = getXY(car_s + 40, 2 + 4*lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp2 = getXY(car_s + 50, 2 + 4*lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
 
             ptsx.push_back(next_wp0[0]);
             ptsx.push_back(next_wp1[0]);
@@ -361,7 +374,7 @@ int main() {
             ptsy.push_back(next_wp1[1]);
             ptsy.push_back(next_wp2[1]);
 
-            // Making coordinates to local car coordinates.
+            // 世界坐标转换为汽车本地坐标,假定每次运行的方向都是按同一个方向行驶，即使变道也忽略方向的变化，当作是直线行驶的
             for ( int i = 0; i < ptsx.size(); i++ ) {
               double shift_x = ptsx[i] - ref_x;
               double shift_y = ptsy[i] - ref_y;
@@ -370,23 +383,24 @@ int main() {
               ptsy[i] = shift_x * sin(0 - ref_yaw) + shift_y * cos(0 - ref_yaw);
             }
 
-            // Create the spline.
+            // 使用样条函数，生成路径曲线
             tk::spline s;
             s.set_points(ptsx, ptsy);
 
-            // Output path points from previous path for continuity.
-          	vector<double> next_x_vals;
+            // 最终路径输出结果 = 之前还没有执行的点 + 新生成的点
+
+            // 之前还没有执行的点
+            vector<double> next_x_vals;
           	vector<double> next_y_vals;
             for ( int i = 0; i < prev_size; i++ ) {
               next_x_vals.push_back(previous_path_x[i]);
               next_y_vals.push_back(previous_path_y[i]);
             }
 
-            // Calculate distance y position on 30 m ahead.
+            // x 坐标 30 米之后的点，加上前面路径的点，一共生成 50 个点
             double target_x = 30.0;
             double target_y = s(target_x);
             double target_dist = sqrt(target_x*target_x + target_y*target_y);
-
             double x_add_on = 0;
 
             for( int i = 1; i < 50 - prev_size; i++ ) {
@@ -396,12 +410,13 @@ int main() {
               } else if ( ref_vel < MAX_ACC ) {
                 ref_vel = MAX_ACC;
               }
-              double N = target_dist/(0.02*ref_vel/2.24);
+              double N = target_dist/(0.02*ref_vel/2.24); // ?
               double x_point = x_add_on + target_x/N;
               double y_point = s(x_point);
 
               x_add_on = x_point;
 
+              // 本地坐标转换为世界坐标
               double x_ref = x_point;
               double y_ref = y_point;
 
@@ -424,7 +439,6 @@ int main() {
 
           	//this_thread::sleep_for(chrono::milliseconds(1000));
           	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
-
         }
       } else {
         // Manual driving
